@@ -1,0 +1,226 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/indore/soundbox
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "IndoreSoundbox"
+          include(":app")
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.indore.soundbox'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.indore.soundbox'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Indore Soundbox"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".PayListener"
+                      android:exported="true"
+                      android:label="Indore Soundbox"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/indore/soundbox/PayListener.kt <<'EOF'
+          package com.indore.soundbox
+
+          import android.app.Notification
+          import android.content.Context
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.speech.tts.TextToSpeech
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object Store {
+              private fun day(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+              fun add(c: Context, d: Double) {
+                  val p = c.getSharedPreferences("s", 0)
+                  val t = today(c)
+                  p.edit().putString("day", day()).putString("t", (t + d).toString()).apply()
+              }
+              fun today(c: Context): Double {
+                  val p = c.getSharedPreferences("s", 0)
+                  return if (p.getString("day", "") == day()) (p.getString("t", "0")?.toDoubleOrNull() ?: 0.0) else 0.0
+              }
+          }
+
+          class PayListener : NotificationListenerService(), TextToSpeech.OnInitListener {
+              private var tts: TextToSpeech? = null
+              private var lastAmt = ""
+              private var lastTime = 0L
+              private val rx = Regex("(?:₹|rs\\.?|inr)\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)", RegexOption.IGNORE_CASE)
+              private val okApps = listOf("phonepe", "paytm", "paisa", "bhim", "messaging", "mms")
+              private val credit = listOf("received", "credited", "paid you", "sent you", "जमा", "प्राप्त")
+              private val debit = listOf("debited", "paid to", "sent to", "you paid", "you sent", "withdrawn")
+
+              override fun onCreate() {
+                  super.onCreate()
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      tts?.language = Locale("hi", "IN")
+                      tts?.setSpeechRate(0.9f)
+                  }
+              }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  val pkg = (sbn.packageName ?: return).lowercase()
+                  if (okApps.none { pkg.contains(it) }) return
+                  val ex = sbn.notification.extras
+                  val text = (
+                      (ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "") + " " +
+                      (ex.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: "") + " " +
+                      (ex.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString() ?: "")
+                  ).lowercase()
+                  if (credit.none { text.contains(it) }) return
+                  if (debit.any { text.contains(it) }) return
+                  val m = rx.find(text) ?: return
+                  val d = m.groupValues[1].replace(",", "").toDoubleOrNull() ?: return
+                  val a = if (d % 1.0 == 0.0) d.toLong().toString() else String.format(Locale.US, "%.2f", d)
+                  val now = System.currentTimeMillis()
+                  if (a == lastAmt && now - lastTime < 30000) return
+                  lastAmt = a
+                  lastTime = now
+                  Store.add(this, d)
+                  tts?.speak("इन्दौर फैशन सेल पर $a रुपये प्राप्त हुए", TextToSpeech.QUEUE_ADD, null, "pay$now")
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/indore/soundbox/MainActivity.kt <<'EOF'
+          package com.indore.soundbox
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.tts.TextToSpeech
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+              private lateinit var tv: TextView
+              private var tts: TextToSpeech? = null
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val l = LinearLayout(this)
+                  l.orientation = LinearLayout.VERTICAL
+                  l.setPadding(48, 96, 48, 48)
+                  val h = TextView(this)
+                  h.text = "Indore Fashion Sale\nSoundbox"
+                  h.textSize = 24f
+                  tv = TextView(this)
+                  tv.textSize = 30f
+                  tv.setPadding(0, 48, 0, 48)
+                  l.addView(h)
+                  l.addView(tv)
+
+                  val b1 = Button(this)
+                  b1.text = "1. Notification Access ON karo"
+                  b1.setOnClickListener {
+                      startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+                  }
+                  l.addView(b1)
+
+                  val b2 = Button(this)
+                  b2.text = "2. Battery Unrestricted karo"
+                  b2.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + packageName)))
+                  }
+                  l.addView(b2)
+
+                  val b3 = Button(this)
+                  b3.text = "3. Voice test"
+                  b3.setOnClickListener {
+                      tts?.speak("इन्दौर फैशन सेल पर 500 रुपये प्राप्त हुए", TextToSpeech.QUEUE_FLUSH, null, "test")
+                  }
+                  l.addView(b3)
+
+                  setContentView(l)
+                  tts = TextToSpeech(this) { s ->
+                      if (s == TextToSpeech.SUCCESS) tts?.language = Locale("hi", "IN")
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  tv.text = "Aaj ka total: ₹" + String.format(Locale.US, "%.2f", Store.today(this))
+              }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soundbox-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
